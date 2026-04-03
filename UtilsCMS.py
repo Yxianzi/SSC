@@ -154,17 +154,16 @@ def ILDA(data_s,data_t,pca_n,r):
 
 
 class DiffGuidedFilter(nn.Module):
-    """可微导向滤波 (边界伪影修复版)"""
+    """可微导向滤波 (自适应平滑度优化版)"""
 
-    def __init__(self, r=1, eps=1e-8):
+    def __init__(self, r=1, eps=0.009):
         super(DiffGuidedFilter, self).__init__()
         self.r = r
-        self.eps = eps
-        # 取消 AvgPool 的自带 padding，改为手动边界复制填充
+        self.eps = nn.Parameter(torch.tensor([eps], dtype=torch.float32))
         self.boxfilter = nn.AvgPool2d(kernel_size=2 * r + 1, stride=1, padding=0, count_include_pad=False)
 
     def _box_filter(self, x):
-        # 采用 replicate 模式填充，消除 9x9 Patch 的边缘黑边效应
+        # 边缘复制填充，避免 Patch 切片黑边
         x_padded = F.pad(x, (self.r, self.r, self.r, self.r), mode='replicate')
         return self.boxfilter(x_padded)
 
@@ -178,7 +177,8 @@ class DiffGuidedFilter(nn.Module):
         var_x = torch.clamp(mean_xx - mean_x * mean_x, min=0.0)
         cov_xy = mean_xy - mean_x * mean_y
 
-        a = cov_xy / (var_x + self.eps)
+        safe_eps = torch.clamp(self.eps, min=1e-6)
+        a = cov_xy / (var_x + safe_eps)
         b = mean_y - a * mean_x
 
         mean_a = self._box_filter(a) / (N_x + 1e-8)
@@ -188,81 +188,73 @@ class DiffGuidedFilter(nn.Module):
 
 
 class SSC_Replacement(nn.Module):
-    """端到端光谱风格校准 (AdaIN + 残差学习版)"""
+    """端到端光谱风格校准 (EMA 全局统计安全版)"""
 
-    def __init__(self, channels, r=1, eps=0.009):
+    def __init__(self, channels, r=1, eps=0.009, momentum=0.1):
         super(SSC_Replacement, self).__init__()
-
-        # 输入维度翻倍：同时接收源域和目标域的统计量 (Mean + Var) -> 4 * channels
         self.stats_encoder = nn.Sequential(
-            nn.Linear(channels * 4, channels * 2),
-            nn.ReLU(),
-            nn.Linear(channels * 2, channels)
+            nn.Linear(channels * 2, channels),
+            nn.ReLU()
         )
-
-        # 预测特定波段的非线性残差微调
-        self.fc_alpha_res = nn.Linear(channels, channels)
-        self.fc_beta_res = nn.Linear(channels, channels)
-
+        self.fc_alpha = nn.Linear(channels, channels)
+        self.fc_beta = nn.Linear(channels, channels)
         self.gf = DiffGuidedFilter(r=r, eps=eps)
+        self.gamma = nn.Parameter(torch.ones(1, channels, 1, 1))
 
-        self._initialize_residual()
+        # 注册 EMA 缓冲区
+        self.register_buffer('running_t_mean', torch.zeros(1, channels))
+        self.register_buffer('running_t_var', torch.ones(1, channels))
+        self.momentum = momentum
 
-    def _initialize_residual(self):
-        """初始化为纯 AdaIN 映射，残差初始为 0"""
-        nn.init.zeros_(self.fc_alpha_res.weight)
-        nn.init.zeros_(self.fc_alpha_res.bias)
-        nn.init.zeros_(self.fc_beta_res.weight)
-        nn.init.zeros_(self.fc_beta_res.bias)
+        self._initialize_identity()
+
+    def _initialize_identity(self):
+        nn.init.zeros_(self.fc_alpha.weight)
+        nn.init.zeros_(self.fc_alpha.bias)
+        nn.init.zeros_(self.fc_beta.weight)
+        nn.init.zeros_(self.fc_beta.bias)
 
     def forward(self, x_s, x_t):
-        B_s, C, H_s, W_s = x_s.shape
-        B_t = x_t.shape[0]
+        B, C, H, W = x_s.shape
 
-        # 1. 提取全局域统计量 (Domain Statistics)
-        s_mean = x_s.view(B_s, C, -1).mean(dim=[0, 2], keepdim=True)  # [1, C, 1]
-        s_var = x_s.view(B_s, C, -1).var(dim=[0, 2], keepdim=True)
+        if self.training:
+            # 安全隔离：先 detach 当前批次的统计量，防止带有意外的梯度属性
+            cur_mean = x_t.view(x_t.shape[0], C, -1).mean(dim=[0, 2]).detach()
+            cur_var = x_t.view(x_t.shape[0], C, -1).var(dim=[0, 2]).detach()
 
-        t_mean = x_t.view(B_t, C, -1).mean(dim=[0, 2], keepdim=True)
-        t_var = x_t.view(B_t, C, -1).var(dim=[0, 2], keepdim=True)
+            with torch.no_grad():
+                # 安全更新：必须使用 copy_ 进行 in-place 赋值，维持 buffer 属性不变
+                new_mean = (1 - self.momentum) * self.running_t_mean + self.momentum * cur_mean.view(1, C)
+                new_var = (1 - self.momentum) * self.running_t_var + self.momentum * cur_var.view(1, C)
+                self.running_t_mean.copy_(new_mean)
+                self.running_t_var.copy_(new_var)
 
-        # 2. 计算显式的 AdaIN 基底变换
-        # 将源域拉伸到目标域的均值和方差分布上 (强有力的线性全局对齐)
-        std_s = torch.sqrt(s_var + 1e-6).view(1, C, 1, 1)
-        std_t = torch.sqrt(t_var + 1e-6).view(1, C, 1, 1)
-        mean_s = s_mean.view(1, C, 1, 1)
-        mean_t = t_mean.view(1, C, 1, 1)
+        # 安全读取：必须 clone().detach()，彻底切断统计参数与动态反向传播图的连接
+        t_mean = self.running_t_mean.clone().detach()
+        t_var = self.running_t_var.clone().detach()
 
-        x_adain = ((x_s - mean_s) / std_s) * std_t + mean_t
+        t_stats = torch.cat([t_mean, t_var], dim=1)
 
-        # 3. 神经网络预测波段级残差微调 (Band-wise Fine-tuning)
-        stats = torch.cat([s_mean.squeeze(-1), s_var.squeeze(-1),
-                           t_mean.squeeze(-1), t_var.squeeze(-1)], dim=1)  # [1, 4C]
+        hidden = self.stats_encoder(t_stats)
+        delta_alpha = self.fc_alpha(hidden).view(1, C, 1, 1)
+        beta = self.fc_beta(hidden).view(1, C, 1, 1)
 
-        hidden = self.stats_encoder(stats)
-        delta_alpha = self.fc_alpha_res(hidden).view(1, C, 1, 1)
-        beta_res = self.fc_beta_res(hidden).view(1, C, 1, 1)
+        alpha = 1.0 + delta_alpha
+        x_calibrated = alpha * x_s + beta
 
-        # 在 AdaIN 的基础上，允许网络进行非线性波段放缩
-        x_calibrated = (1.0 + delta_alpha) * x_adain + beta_res
+        x_gf = self.gf(guidance=x_calibrated, src=x_s)
+        x_final = x_s + self.gamma * (x_gf - x_s)
 
-        # 4. 【致命Bug修复】: 必须以 x_s 为引导(保留边缘)，逼近 x_calibrated(获取目标光谱)
-        x_gf = self.gf(guidance=x_s, src=x_calibrated)
-
-        return x_gf, x_calibrated
-
+        return x_final, x_calibrated
 
 def spectral_angle_loss(x, x_calibrated):
     """物理一致性约束：SAM Loss (数值稳定版)"""
-    # 直接在空间维度上逐像素计算，避免 view 带来的维度混淆
     dot_product = torch.sum(x * x_calibrated, dim=1)
 
-    # 手动计算 L2 范数，并在根号内 + 1e-8，彻底解决全 0 Padding 导致导数为 NaN 的问题
     norm_x = torch.sqrt(torch.sum(x ** 2, dim=1) + 1e-8)
     norm_xc = torch.sqrt(torch.sum(x_calibrated ** 2, dim=1) + 1e-8)
 
     cos_theta = dot_product / (norm_x * norm_xc + 1e-8)
-    # 稍微收紧 clamp 的范围，避免 acos 在极端接近 1 或 -1 时梯度不稳定
     cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
 
     return torch.mean(torch.acos(cos_theta))
