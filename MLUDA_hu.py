@@ -149,9 +149,7 @@ for iDataSet in range(nDataSet):
 
             # ====== 新增: 更新全局类别原型 (EMA机制) ======
             feature_encoder.update_prototypes(
-                f_s=source_features.detach(),
                 label_s=source_label.cuda(),
-                f_t=target_features.detach(),
                 prob_t=softmax_output_t,
                 threshold=0.9
             )
