@@ -106,7 +106,7 @@ for iDataSet in range(nDataSet):
         ], lr=LEARNING_RATE, momentum=momentum, weight_decay=l2_decay)
 
         # 优化器 2：SSC 模块（使用更小的学习率，如主干的 0.1 倍，防止破坏图像结构）
-        optimizer_ssc = torch.optim.Adam(ssc_module.parameters(), lr=lr * 0.1, weight_decay=1e-4)
+        optimizer_ssc = torch.optim.Adam(ssc_module.parameters(), lr=1e-4, weight_decay=1e-4)
 
         # 模块状态设置：直接进行联合训练
         feature_encoder.train()
@@ -185,7 +185,10 @@ for iDataSet in range(nDataSet):
             loss_backbone = cls_loss + 0.01 * lambd * lmmd_loss + contrastive_loss_s + contrastive_loss_t + domain_similar_loss
 
             # 2. 计算 SSC 物理约束损失 (约束源域原始图像与 SSC 仿射输出的光谱角不发生畸变)
-            sam_loss = spectral_angle_loss(source_data_cuda, source_calibrated)
+            sam_loss = spectral_angle_loss(source_data_cuda, source_data_gf)
+
+            sam_weight = 0.5 * max(0.1, 1.0 - 0.1 * epoch)
+            loss_ssc = sam_weight * sam_loss
 
             # 3. 损失合并
             total_loss = loss_backbone + 1.0 * sam_loss

@@ -154,69 +154,101 @@ def ILDA(data_s,data_t,pca_n,r):
 
 
 class DiffGuidedFilter(nn.Module):
-    """可微导向滤波 (数值稳定版)"""
+    """可微导向滤波 (边界伪影修复版)"""
 
     def __init__(self, r=1, eps=1e-8):
         super(DiffGuidedFilter, self).__init__()
         self.r = r
         self.eps = eps
-        self.boxfilter = nn.AvgPool2d(kernel_size=2 * r + 1, stride=1, padding=r, count_include_pad=False)
+        # 取消 AvgPool 的自带 padding，改为手动边界复制填充
+        self.boxfilter = nn.AvgPool2d(kernel_size=2 * r + 1, stride=1, padding=0, count_include_pad=False)
+
+    def _box_filter(self, x):
+        # 采用 replicate 模式填充，消除 9x9 Patch 的边缘黑边效应
+        x_padded = F.pad(x, (self.r, self.r, self.r, self.r), mode='replicate')
+        return self.boxfilter(x_padded)
 
     def forward(self, guidance, src):
-        N_x = self.boxfilter(torch.ones_like(guidance))
-        mean_x = self.boxfilter(guidance) / (N_x + 1e-8)
-        mean_y = self.boxfilter(src) / (N_x + 1e-8)
-        mean_xx = self.boxfilter(guidance * guidance) / (N_x + 1e-8)
-        mean_xy = self.boxfilter(guidance * src) / (N_x + 1e-8)
+        N_x = self._box_filter(torch.ones_like(guidance))
+        mean_x = self._box_filter(guidance) / (N_x + 1e-8)
+        mean_y = self._box_filter(src) / (N_x + 1e-8)
+        mean_xx = self._box_filter(guidance * guidance) / (N_x + 1e-8)
+        mean_xy = self._box_filter(guidance * src) / (N_x + 1e-8)
 
-        # 核心修复：增加 torch.clamp 强制方差 >= 0，防止浮点误差导致负数
         var_x = torch.clamp(mean_xx - mean_x * mean_x, min=0.0)
         cov_xy = mean_xy - mean_x * mean_y
 
         a = cov_xy / (var_x + self.eps)
         b = mean_y - a * mean_x
 
-        mean_a = self.boxfilter(a) / (N_x + 1e-8)
-        mean_b = self.boxfilter(b) / (N_x + 1e-8)
+        mean_a = self._box_filter(a) / (N_x + 1e-8)
+        mean_b = self._box_filter(b) / (N_x + 1e-8)
 
         return mean_a * guidance + mean_b
 
 
 class SSC_Replacement(nn.Module):
-    """端到端光谱风格校准模块"""
+    """端到端光谱风格校准 (AdaIN + 残差学习版)"""
 
     def __init__(self, channels, r=1, eps=0.009):
         super(SSC_Replacement, self).__init__()
+
+        # 输入维度翻倍：同时接收源域和目标域的统计量 (Mean + Var) -> 4 * channels
         self.stats_encoder = nn.Sequential(
-            nn.Linear(channels * 2, channels),
-            nn.ReLU()
+            nn.Linear(channels * 4, channels * 2),
+            nn.ReLU(),
+            nn.Linear(channels * 2, channels)
         )
-        self.fc_alpha = nn.Linear(channels, channels)
-        self.fc_beta = nn.Linear(channels, channels)
+
+        # 预测特定波段的非线性残差微调
+        self.fc_alpha_res = nn.Linear(channels, channels)
+        self.fc_beta_res = nn.Linear(channels, channels)
+
         self.gf = DiffGuidedFilter(r=r, eps=eps)
 
-        self._initialize_identity()
+        self._initialize_residual()
 
-    def _initialize_identity(self):
-        """近似恒等映射初始化"""
-        nn.init.zeros_(self.fc_alpha.weight)
-        nn.init.zeros_(self.fc_alpha.bias)
-        nn.init.zeros_(self.fc_beta.weight)
-        nn.init.zeros_(self.fc_beta.bias)
+    def _initialize_residual(self):
+        """初始化为纯 AdaIN 映射，残差初始为 0"""
+        nn.init.zeros_(self.fc_alpha_res.weight)
+        nn.init.zeros_(self.fc_alpha_res.bias)
+        nn.init.zeros_(self.fc_beta_res.weight)
+        nn.init.zeros_(self.fc_beta_res.bias)
 
     def forward(self, x_s, x_t):
-        B, C, H, W = x_s.shape
-        t_mean = x_t.view(B, C, -1).mean(dim=2)
-        t_var = x_t.view(B, C, -1).var(dim=2)
-        t_stats = torch.cat([t_mean, t_var], dim=1)
+        B_s, C, H_s, W_s = x_s.shape
+        B_t = x_t.shape[0]
 
-        hidden = self.stats_encoder(t_stats)
-        delta_alpha = self.fc_alpha(hidden).view(B, C, 1, 1)
-        beta = self.fc_beta(hidden).view(B, C, 1, 1)
+        # 1. 提取全局域统计量 (Domain Statistics)
+        s_mean = x_s.view(B_s, C, -1).mean(dim=[0, 2], keepdim=True)  # [1, C, 1]
+        s_var = x_s.view(B_s, C, -1).var(dim=[0, 2], keepdim=True)
 
-        alpha = 1.0 + delta_alpha
-        x_calibrated = alpha * x_s + beta
-        x_gf = self.gf(guidance=x_calibrated, src=x_s)
+        t_mean = x_t.view(B_t, C, -1).mean(dim=[0, 2], keepdim=True)
+        t_var = x_t.view(B_t, C, -1).var(dim=[0, 2], keepdim=True)
+
+        # 2. 计算显式的 AdaIN 基底变换
+        # 将源域拉伸到目标域的均值和方差分布上 (强有力的线性全局对齐)
+        std_s = torch.sqrt(s_var + 1e-6).view(1, C, 1, 1)
+        std_t = torch.sqrt(t_var + 1e-6).view(1, C, 1, 1)
+        mean_s = s_mean.view(1, C, 1, 1)
+        mean_t = t_mean.view(1, C, 1, 1)
+
+        x_adain = ((x_s - mean_s) / std_s) * std_t + mean_t
+
+        # 3. 神经网络预测波段级残差微调 (Band-wise Fine-tuning)
+        stats = torch.cat([s_mean.squeeze(-1), s_var.squeeze(-1),
+                           t_mean.squeeze(-1), t_var.squeeze(-1)], dim=1)  # [1, 4C]
+
+        hidden = self.stats_encoder(stats)
+        delta_alpha = self.fc_alpha_res(hidden).view(1, C, 1, 1)
+        beta_res = self.fc_beta_res(hidden).view(1, C, 1, 1)
+
+        # 在 AdaIN 的基础上，允许网络进行非线性波段放缩
+        x_calibrated = (1.0 + delta_alpha) * x_adain + beta_res
+
+        # 4. 【致命Bug修复】: 必须以 x_s 为引导(保留边缘)，逼近 x_calibrated(获取目标光谱)
+        x_gf = self.gf(guidance=x_s, src=x_calibrated)
+
         return x_gf, x_calibrated
 
 
