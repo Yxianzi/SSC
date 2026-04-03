@@ -206,21 +206,21 @@ for iDataSet in range(nDataSet):
             test_accuracy = 100. * float(total_hit) / size
 
             # 兼容预热期：如果还在预热期，主干网络的损失赋值为 0.0
-            c_loss = cls_loss.item() if epoch > ssc_warmup_epochs else 0.0
-            l_loss = lmmd_loss.item() if epoch > ssc_warmup_epochs else 0.0
-            cs_loss = contrastive_loss_s.item() if epoch > ssc_warmup_epochs else 0.0
-            ct_loss = contrastive_loss_t.item() if epoch > ssc_warmup_epochs else 0.0
+        c_loss = cls_loss.item() if epoch > ssc_warmup_epochs else 0.0
+        l_loss = lmmd_loss.item() if epoch > ssc_warmup_epochs else 0.0
+        cs_loss = contrastive_loss_s.item() if epoch > ssc_warmup_epochs else 0.0
+        ct_loss = contrastive_loss_t.item() if epoch > ssc_warmup_epochs else 0.0
 
-            print(
-                'epoch {:>3d}: cls loss: {:6.4f}, lmmd loss: {:6.4f}, con_s loss: {:6.4f}, con_t loss: {:6.4f}, sam loss: {:6.4f}, acc {:6.4f}, total loss: {:6.4f}'
-                .format(epoch,
-                        c_loss,
-                        l_loss,
-                        cs_loss,
-                        ct_loss,
-                        sam_loss.item(),
-                        total_hit / (size + 1e-8),  # 防止 size 为 0 除零报错
-                        total_loss.item()))
+        print(
+            'epoch {:>3d}: cls loss: {:6.4f}, lmmd loss: {:6.4f}, con_s loss: {:6.4f}, con_t loss: {:6.4f}, sam loss: {:6.4f}, acc {:6.4f}, total loss: {:6.4f}'
+            .format(epoch,
+                    c_loss,
+                    l_loss,
+                    cs_loss,
+                    ct_loss,
+                    sam_loss.item(),
+                    total_hit / (size + 1e-8),  # 防止 size 为 0 除零报错
+                    total_loss.item()))
 
         train_end = time.time()
         if epoch % epochs == 0:

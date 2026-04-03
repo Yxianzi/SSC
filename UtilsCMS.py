@@ -154,7 +154,7 @@ def ILDA(data_s,data_t,pca_n,r):
 
 
 class DiffGuidedFilter(nn.Module):
-    """可微导向滤波"""
+    """可微导向滤波 (数值稳定版)"""
 
     def __init__(self, r=1, eps=1e-8):
         super(DiffGuidedFilter, self).__init__()
@@ -169,7 +169,8 @@ class DiffGuidedFilter(nn.Module):
         mean_xx = self.boxfilter(guidance * guidance) / (N_x + 1e-8)
         mean_xy = self.boxfilter(guidance * src) / (N_x + 1e-8)
 
-        var_x = mean_xx - mean_x * mean_x
+        # 核心修复：增加 torch.clamp 强制方差 >= 0，防止浮点误差导致负数
+        var_x = torch.clamp(mean_xx - mean_x * mean_x, min=0.0)
         cov_xy = mean_xy - mean_x * mean_y
 
         a = cov_xy / (var_x + self.eps)
@@ -177,6 +178,7 @@ class DiffGuidedFilter(nn.Module):
 
         mean_a = self.boxfilter(a) / (N_x + 1e-8)
         mean_b = self.boxfilter(b) / (N_x + 1e-8)
+
         return mean_a * guidance + mean_b
 
 
@@ -219,15 +221,17 @@ class SSC_Replacement(nn.Module):
 
 
 def spectral_angle_loss(x, x_calibrated):
-    """物理一致性约束：SAM Loss"""
-    x_flat = x.view(x.size(0), x.size(1), -1)
-    xc_flat = x_calibrated.view(x_calibrated.size(0), x_calibrated.size(1), -1)
+    """物理一致性约束：SAM Loss (数值稳定版)"""
+    # 直接在空间维度上逐像素计算，避免 view 带来的维度混淆
+    dot_product = torch.sum(x * x_calibrated, dim=1)
 
-    dot_product = torch.sum(x_flat * xc_flat, dim=1)
-    norm_x = torch.norm(x_flat, dim=1)
-    norm_xc = torch.norm(xc_flat, dim=1)
+    # 手动计算 L2 范数，并在根号内 + 1e-8，彻底解决全 0 Padding 导致导数为 NaN 的问题
+    norm_x = torch.sqrt(torch.sum(x ** 2, dim=1) + 1e-8)
+    norm_xc = torch.sqrt(torch.sum(x_calibrated ** 2, dim=1) + 1e-8)
 
     cos_theta = dot_product / (norm_x * norm_xc + 1e-8)
-    cos_theta = torch.clamp(cos_theta, -1.0 + 1e-8, 1.0 - 1e-8)
+    # 稍微收紧 clamp 的范围，避免 acos 在极端接近 1 或 -1 时梯度不稳定
+    cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
+
     return torch.mean(torch.acos(cos_theta))
 
