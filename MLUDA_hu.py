@@ -147,6 +147,15 @@ for iDataSet in range(nDataSet):
             softmax_output_t = nn.Softmax(dim=1)(target_outputs).detach()
             _, pseudo_label_t = torch.max(softmax_output_t, 1)
 
+            # ====== 新增: 更新全局类别原型 (EMA机制) ======
+            feature_encoder.update_prototypes(
+                f_s=source_features.detach(),
+                label_s=source_label.cuda(),
+                f_t=target_features.detach(),
+                prob_t=softmax_output_t,
+                threshold=0.9
+            )
+
             all_source_con_features = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
             all_target_con_features = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
 
