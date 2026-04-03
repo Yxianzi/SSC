@@ -36,7 +36,6 @@ class ProtoCrossAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
 
-        # Query 映射目标/源域 token，Key/Value 映射原型
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
@@ -48,33 +47,33 @@ class ProtoCrossAttention(nn.Module):
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
 
+        # 零初始化残差投影层，消除初始梯度对特征空间的冲击
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
     def forward(self, query_feat, proto_feat):
-        """
-        query_feat: (B, D) 比如目标域的特征 token
-        proto_feat: (C, D) 对应的语义原型 (C 为类别数)
-        """
         B, D = query_feat.shape
         C, _ = proto_feat.shape
 
         x = self.norm1(query_feat)
         p = self.norm2(proto_feat)
 
-        q = self.q_proj(x).reshape(B, self.num_heads, self.head_dim).permute(1, 0, 2)  # (H, B, d)
-        k = self.k_proj(p).reshape(C, self.num_heads, self.head_dim).permute(1, 2, 0)  # (H, d, C)
-        v = self.v_proj(p).reshape(C, self.num_heads, self.head_dim).permute(1, 0, 2)  # (H, C, d)
+        q = self.q_proj(x).reshape(B, self.num_heads, self.head_dim).permute(1, 0, 2)
+        k = self.k_proj(p).reshape(C, self.num_heads, self.head_dim).permute(1, 2, 0)
+        v = self.v_proj(p).reshape(C, self.num_heads, self.head_dim).permute(1, 0, 2)
 
-        attn = (q @ k) * self.scale  # (H, B, C)
+        attn = (q @ k) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        out = (attn @ v)  # (H, B, d)
-        out = out.permute(1, 0, 2).reshape(B, D)  # (B, D)
+        out = (attn @ v)
+        out = out.permute(1, 0, 2).reshape(B, D)
 
         out = self.proj(out)
         out = self.proj_drop(out)
 
-        # 引入残差使得特征融合平滑
         return query_feat + out
+
 
 class DSANSS(nn.Module):
     def __init__(self, n_band=198, patch_size=3, num_class=7, momentum=0.9):
@@ -85,13 +84,12 @@ class DSANSS(nn.Module):
 
         self.feature_layers = DCRN_02_DSBN(n_band, patch_size, num_class)
 
-        # 类别原型缓冲 (C, D)
         self.register_buffer('source_prototypes', torch.zeros(num_class, self.n_outputs))
         self.register_buffer('target_prototypes', torch.zeros(num_class, self.n_outputs))
 
-        # 原型引导的交叉注意力机制
+        # 强制单向锚定：源域与目标域特征均向高质量的源域原型对齐
         self.proto_attn_t2s = ProtoCrossAttention(dim=self.n_outputs)
-        self.proto_attn_s2t = ProtoCrossAttention(dim=self.n_outputs)
+        self.proto_attn_s2s = ProtoCrossAttention(dim=self.n_outputs)
 
         self.fc1 = nn.Linear(self.n_outputs, num_class)
         self.fc2 = nn.Linear(self.n_outputs, 1)
@@ -100,47 +98,59 @@ class DSANSS(nn.Module):
         self.head2 = nn.Sequential(nn.Linear(self.n_outputs, 128))
         self.sigmoid = nn.Sigmoid()
 
-    def update_prototypes(self, f_s, label_s, f_t, prob_t, threshold=0.9):
-        """外部调用：基于批次特征更新全局 EMA 原型"""
-        # 更新源域原型
+        self.raw_feat_x = None
+        self.raw_feat_y = None
+
+    @torch.no_grad()
+    def update_prototypes(self, label_s, prob_t, threshold=0.9):
+        if self.raw_feat_x is None or self.raw_feat_y is None:
+            return
+
+        f_s = self.raw_feat_x
+        f_t = self.raw_feat_y
+
         for c in range(self.num_class):
             mask_s = (label_s == c)
             if mask_s.sum() > 0:
                 curr_p_s = f_s[mask_s].mean(dim=0)
                 if self.source_prototypes[c].sum() == 0:
-                    self.source_prototypes[c] = curr_p_s.detach()
+                    self.source_prototypes[c].copy_(curr_p_s)
                 else:
-                    self.source_prototypes[c] = self.momentum * self.source_prototypes[c] + (
-                                1 - self.momentum) * curr_p_s.detach()
+                    self.source_prototypes[c].copy_(
+                        self.momentum * self.source_prototypes[c] + (1 - self.momentum) * curr_p_s)
 
-        # 更新目标域原型 (利用高置信度伪标签)
         max_prob, pseudo_label = torch.max(prob_t, dim=1)
         for c in range(self.num_class):
             mask_t = (pseudo_label == c) & (max_prob > threshold)
             if mask_t.sum() > 0:
                 curr_p_t = f_t[mask_t].mean(dim=0)
                 if self.target_prototypes[c].sum() == 0:
-                    self.target_prototypes[c] = curr_p_t.detach()
+                    self.target_prototypes[c].copy_(curr_p_t)
                 else:
-                    self.target_prototypes[c] = self.momentum * self.target_prototypes[c] + (
-                                1 - self.momentum) * curr_p_t.detach()
+                    self.target_prototypes[c].copy_(
+                        self.momentum * self.target_prototypes[c] + (1 - self.momentum) * curr_p_t)
 
-    def forward(self, x, y):
-        # 1. 经过 DSBN 分离归一化
-        features_x, features_y = self.feature_layers(x, y)
+        self.raw_feat_x = None
+        self.raw_feat_y = None
 
-        # 2. 原型引导的语义对齐 (如果原型已经初始化)
+    def forward(self, x, y, cache_raw_features=False):
+        features_x = self.feature_layers.forward_single_domain(x, domain='source')
+        features_y = self.feature_layers.forward_single_domain(y, domain='target')
+
+        # 精确隔离增强样本：仅在标记位为 True 时捕获原始特征用于原型更新
+        if cache_raw_features and self.training:
+            self.raw_feat_x = features_x.detach()
+            self.raw_feat_y = features_y.detach()
+
+        # 断绝特征维度的反向污染
         if self.source_prototypes.sum() != 0:
-            aligned_y = self.proto_attn_t2s(features_y, self.source_prototypes)
+            safe_source_proto = self.source_prototypes.clone().detach()
+            aligned_y = self.proto_attn_t2s(features_y, safe_source_proto)
+            aligned_x = self.proto_attn_s2s(features_x, safe_source_proto)
         else:
             aligned_y = features_y
-
-        if self.target_prototypes.sum() != 0:
-            aligned_x = self.proto_attn_s2t(features_x, self.target_prototypes)
-        else:
             aligned_x = features_x
 
-        # 后续投影和分类
         x1 = F.normalize(self.head1(aligned_x), dim=1)
         x2 = F.normalize(self.head2(aligned_x), dim=1)
         fea_x = self.fc1(aligned_x)
@@ -152,13 +162,6 @@ class DSANSS(nn.Module):
         output_y = self.sigmoid(self.fc2(aligned_y))
 
         return aligned_x, x1, x2, fea_x, output_x, aligned_y, y1, y2, fea_y, output_y
-
-    def get_embedding(self, x):
-        # 单独推理时作为 target
-        feat = self.feature_layers.forward_single_domain(x, domain='target')
-        if self.source_prototypes.sum() != 0:
-            feat = self.proto_attn_t2s(feat, self.source_prototypes)
-        return feat
 
 class DSAN1(nn.Module):
     def __init__(self, n_band=198, patch_size=3,num_class=3):
@@ -244,7 +247,6 @@ class DCRN_02_DSBN(nn.Module):
         self.feature_dim = input_channels
         self.sz = patch_size
 
-        # 替换所有的 BatchNorm3d 为 DSBN3d
         self.conv1 = nn.Conv3d(1, 24, kernel_size=(7, 1, 1), stride=(2, 1, 1), bias=True)
         self.bn1 = DSBN3d(24)
         self.activation1 = nn.ReLU()
@@ -290,14 +292,12 @@ class DCRN_02_DSBN(nn.Module):
         self.sa = SpatialAttention()
         self.avgpool = nn.AvgPool3d((1, self.sz, self.sz))
 
-        # 初始化
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
                 torch.nn.init.kaiming_normal_(m.weight.data)
                 m.bias.data.zero_()
 
     def forward_single_domain(self, x, domain):
-        """处理单域前向传播，明确区分统计量"""
         x = x.unsqueeze(1)
         x1 = self.conv1(x)
         x1 = self.activation1(self.bn1(x1, domain))
@@ -334,11 +334,6 @@ class DCRN_02_DSBN(nn.Module):
         out = self.avgpool(out)
         out = out.view(out.shape[0], -1)
         return out
-
-    def forward(self, x, y):
-        feat_x = self.forward_single_domain(x, domain='source')
-        feat_y = self.forward_single_domain(y, domain='target')
-        return feat_x, feat_y
 
 class CrossAttention(nn.Module):
     def __init__(self,

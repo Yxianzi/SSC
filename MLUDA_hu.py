@@ -156,6 +156,10 @@ for iDataSet in range(nDataSet):
                 threshold=0.9
             )
 
+            pred = source_outputs.data.max(1)[1]
+            total_hit += pred.eq(source_label.data.cuda()).sum()
+            size += source_label.data.size()[0]
+
             all_source_con_features = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
             all_target_con_features = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
 
@@ -187,6 +191,12 @@ for iDataSet in range(nDataSet):
             pred = source_outputs.data.max(1)[1]
             total_hit += pred.eq(source_label.data.cuda()).sum()
             size += source_label.data.size()[0]
+
+            feature_encoder.update_prototypes(
+                label_s=source_label.cuda(),
+                prob_t=softmax_output_t,
+                threshold=0.9
+            )
 
         test_accuracy = 100. * float(total_hit) / (size + 1e-8)
 
