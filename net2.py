@@ -30,47 +30,41 @@ class DSBN3d(nn.Module):
 # 2. 原型引导的交叉注意力 (Prototype-guided CA)
 # ==========================================
 class ProtoCrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=4, attn_drop_ratio=0.5, proj_drop_ratio=0.5):
+    def __init__(self, dim):
         super(ProtoCrossAttention, self).__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
 
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
+        # 仅对 Value 进行投影，维持特征维度
         self.v_proj = nn.Linear(dim, dim)
 
-        self.attn_drop = nn.Dropout(attn_drop_ratio)
+        # 残差投影层
         self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop_ratio)
 
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-
-        # 零初始化残差投影层，消除初始梯度对特征空间的冲击
+        # 零初始化残差门，确保初始阶段为严格的恒等映射 (Identity Mapping)
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
+        # 余弦缩放温度系数 (可学习)
+        self.temperature = nn.Parameter(torch.tensor(10.0))
+
     def forward(self, query_feat, proto_feat):
-        B, D = query_feat.shape
-        C, _ = proto_feat.shape
+        """
+        query_feat: (B, D) 目标或源域的 Token
+        proto_feat: (C, D) C个类别的全局原型
+        """
+        # 强制使用 L2 归一化特征计算余弦相似度，避免范数尺度干扰
+        q_norm = F.normalize(query_feat, p=2, dim=-1)
+        p_norm = F.normalize(proto_feat, p=2, dim=-1)
 
-        x = self.norm1(query_feat)
-        p = self.norm2(proto_feat)
+        # 核心修改：计算严格语义对齐的 Attention Map (B, C)
+        # 彻底抛弃随机初始化的 Q/K 映射
+        attn = torch.matmul(q_norm, p_norm.transpose(0, 1)) * self.temperature
+        attn = F.softmax(attn, dim=-1)
 
-        q = self.q_proj(x).reshape(B, self.num_heads, self.head_dim).permute(1, 0, 2)
-        k = self.k_proj(p).reshape(C, self.num_heads, self.head_dim).permute(1, 2, 0)
-        v = self.v_proj(p).reshape(C, self.num_heads, self.head_dim).permute(1, 0, 2)
-
-        attn = (q @ k) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        out = (attn @ v)
-        out = out.permute(1, 0, 2).reshape(B, D)
+        # 提取对应原型的 Value 并融合
+        v = self.v_proj(proto_feat)
+        out = torch.matmul(attn, v)  # (B, D)
 
         out = self.proj(out)
-        out = self.proj_drop(out)
 
         return query_feat + out
 
@@ -87,9 +81,8 @@ class DSANSS(nn.Module):
         self.register_buffer('source_prototypes', torch.zeros(num_class, self.n_outputs))
         self.register_buffer('target_prototypes', torch.zeros(num_class, self.n_outputs))
 
-        # 强制单向锚定：源域与目标域特征均向高质量的源域原型对齐
-        self.proto_attn_t2s = ProtoCrossAttention(dim=self.n_outputs)
-        self.proto_attn_s2s = ProtoCrossAttention(dim=self.n_outputs)
+        # 【核心修正】强制共享同一个注意力模块，保证输出特征处于同一子空间
+        self.shared_proto_attn = ProtoCrossAttention(dim=self.n_outputs)
 
         self.fc1 = nn.Linear(self.n_outputs, num_class)
         self.fc2 = nn.Linear(self.n_outputs, 1)
@@ -137,19 +130,18 @@ class DSANSS(nn.Module):
         features_x = self.feature_layers.forward_single_domain(x, domain='source')
         features_y = self.feature_layers.forward_single_domain(y, domain='target')
 
-        # 精确隔离增强样本：仅在标记位为 True 时捕获原始特征用于原型更新
         if cache_raw_features and self.training:
             self.raw_feat_x = features_x.detach()
             self.raw_feat_y = features_y.detach()
 
-        # 断绝特征维度的反向污染
+        # 【核心修正】源域和目标域使用相同的 shared_proto_attn 权重进行融合
         if self.source_prototypes.sum() != 0:
             safe_source_proto = self.source_prototypes.clone().detach()
-            aligned_y = self.proto_attn_t2s(features_y, safe_source_proto)
-            aligned_x = self.proto_attn_s2s(features_x, safe_source_proto)
+            aligned_x = self.shared_proto_attn(features_x, safe_source_proto)
+            aligned_y = self.shared_proto_attn(features_y, safe_source_proto)
         else:
-            aligned_y = features_y
             aligned_x = features_x
+            aligned_y = features_y
 
         x1 = F.normalize(self.head1(aligned_x), dim=1)
         x2 = F.normalize(self.head2(aligned_x), dim=1)
@@ -162,6 +154,13 @@ class DSANSS(nn.Module):
         output_y = self.sigmoid(self.fc2(aligned_y))
 
         return aligned_x, x1, x2, fea_x, output_x, aligned_y, y1, y2, fea_y, output_y
+
+    def get_embedding(self, x):
+        feat = self.feature_layers.forward_single_domain(x, domain='target')
+        if self.source_prototypes.sum() != 0:
+            # 【同步修正】测试阶段同样使用 shared_proto_attn
+            feat = self.shared_proto_attn(feat, self.source_prototypes.clone().detach())
+        return feat
 
 class DSAN1(nn.Module):
     def __init__(self, n_band=198, patch_size=3,num_class=3):

@@ -100,6 +100,8 @@ for iDataSet in range(nDataSet):
             {'params': feature_encoder.fc2.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.head1.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},
+            # 【同步修正】替换原有的 t2s 和 s2s，改为注册 shared_proto_attn
+            {'params': feature_encoder.shared_proto_attn.parameters(), 'lr': LEARNING_RATE},
         ], lr=LEARNING_RATE, momentum=momentum, weight_decay=l2_decay)
 
         optimizer_ssc = torch.optim.Adam(ssc_module.parameters(), lr=1e-4, weight_decay=1e-4)
