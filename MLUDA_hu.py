@@ -20,6 +20,7 @@ from contrastive_loss import SupConLoss
 from config_Houston import *
 from sklearn import svm
 from UtilsCMS import *
+from ssc_module import EndToEndSSC
 
 ##################################
 data_path_s = './datasets/Houston/Houston13.mat'
@@ -30,7 +31,11 @@ label_path_t = './datasets/Houston/Houston18_7gt.mat'
 data_s,label_s = utils.load_data_houston(data_path_s,label_path_s)
 data_t,label_t = utils.load_data_houston(data_path_t,label_path_t)
 
-data_s,data_t = ILDA(data_s,data_t,pca_n,radius)
+"""data_s,data_t = ILDA(data_s,data_t,pca_n,radius)"""
+feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()
+ssc_module = SSC_Replacement(channels=nBand, r=1, eps=radius).cuda()
+
+ssc_warmup_epochs = 5
 
 # Loss Function
 crossEntropy = nn.CrossEntropyLoss().cuda()
@@ -87,18 +92,37 @@ for iDataSet in range(nDataSet):
     loss2 = []
     loss3 = []
 
+
     for epoch in range(1, epochs + 1):
         LEARNING_RATE = lr / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
-        print('learning rate{: .4f}'.format(LEARNING_RATE))
-        optimizer = torch.optim.SGD([
-            {'params': feature_encoder.feature_layers.parameters(),},
+
+        # 优化器分离
+        optimizer_backbone = torch.optim.SGD([
+            {'params': feature_encoder.feature_layers.parameters()},
             {'params': feature_encoder.fc1.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.fc2.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.head1.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},
-        ], lr=LEARNING_RATE , momentum=momentum, weight_decay=l2_decay)
+        ], lr=LEARNING_RATE, momentum=momentum, weight_decay=l2_decay)
 
+        # 优化器 2：SSC 模块（使用更小的学习率，如主干的 0.1 倍，防止破坏图像结构）
+        optimizer_ssc = torch.optim.Adam(ssc_module.parameters(), lr=lr * 0.1, weight_decay=1e-4)
+
+        # 模块状态设置：直接进行联合训练
         feature_encoder.train()
+        ssc_module.train()
+
+        # 状态控制
+        if epoch <= ssc_warmup_epochs:
+            feature_encoder.eval()
+            ssc_module.train()
+            for param in feature_encoder.parameters(): param.requires_grad = False
+            for param in ssc_module.parameters(): param.requires_grad = True
+        else:
+            feature_encoder.train()
+            ssc_module.train()
+            for param in feature_encoder.parameters(): param.requires_grad = True
+            for param in ssc_module.parameters(): param.requires_grad = True
 
         iter_source = iter(train_loader_s)
         iter_target = iter(train_loader_t)
@@ -111,23 +135,30 @@ for iDataSet in range(nDataSet):
             if i % len_target_loader == 0:
                 iter_target = iter(train_loader_t)
 
-            # 0
-            source_data0 = utils.radiation_noise(source_data)
-            source_data0 = source_data0.type(torch.FloatTensor)
-            # 1
-            source_data1 = utils.flip_augmentation(source_data)
-            # 2
-            target_data0 = utils.radiation_noise(target_data)
-            target_data0 = target_data0.type(torch.FloatTensor)
-            # 3
-            target_data1 = utils.flip_augmentation(target_data)
+            source_data_cuda = source_data.cuda()
+            target_data_cuda = target_data.cuda()
 
+            # --- 核心改动 1：原始数据输入 SSC 模块 ---
+            # 目标域引导源域进行校准，输出导向滤波后的源域图像和用于计算 SAM loss 的纯校准图像
+            source_data_gf, source_calibrated = ssc_module(source_data_cuda, target_data_cuda)
+            # 目标域进行自校准（恒等映射近似）
+            target_data_gf, _ = ssc_module(target_data_cuda, target_data_cuda)
+
+            # --- 核心改动 2：基于 SSC 输出进行数据增强 (需使用 GPU 版本的增广函数) ---
+            source_data0 = utils.radiation_noise_pt(source_data_gf)
+            source_data1 = utils.flip_augmentation_pt(source_data_gf)
+            target_data0 = utils.radiation_noise_pt(target_data_gf)
+            target_data1 = utils.flip_augmentation_pt(target_data_gf)
+
+            # --- 核心改动 3：将 SSC 输出送入特征提取器 ---
             (source_features, source1, _, source_outputs, source_out,
-             target_features,_, target1, target_outputs, target_out) = feature_encoder(source_data.cuda(),target_data.cuda())
-            (_, source2, _, source_outputs2 ,_,
-             _, _, target2, t1, _) = feature_encoder(source_data0.cuda(),target_data0.cuda())
-            (_, source3, _, source_outputs3,_,
-            _, _, target3, t2, _) =  feature_encoder(source_data1.cuda(),target_data1.cuda())
+             target_features, _, target1, target_outputs, target_out) = feature_encoder(source_data_gf, target_data_gf)
+
+            (_, source2, _, source_outputs2, _,
+             _, _, target2, t1, _) = feature_encoder(source_data0, target_data0)
+
+            (_, source3, _, source_outputs3, _,
+             _, _, target3, t2, _) = feature_encoder(source_data1, target_data1)
 
             softmax_output_t = nn.Softmax(dim=1)(target_outputs).detach()
             _, pseudo_label_t = torch.max(softmax_output_t, 1)
@@ -150,12 +181,23 @@ for iDataSet in range(nDataSet):
             # Loss Occ
             domain_similar_loss = DSH_loss(source_out, target_out)
 
-            loss = cls_loss + 0.01 * lambd * lmmd_loss + contrastive_loss_s + contrastive_loss_t + domain_similar_loss
+            # 1. 计算原 MLUDA 损失总和
+            loss_backbone = cls_loss + 0.01 * lambd * lmmd_loss + contrastive_loss_s + contrastive_loss_t + domain_similar_loss
 
-            # Update parameters
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # 2. 计算 SSC 物理约束损失 (约束源域原始图像与 SSC 仿射输出的光谱角不发生畸变)
+            sam_loss = spectral_angle_loss(source_data_cuda, source_calibrated)
+
+            # 3. 损失合并
+            total_loss = loss_backbone + 1.0 * sam_loss
+
+            # 4. 联合更新参数
+            optimizer_backbone.zero_grad()
+            optimizer_ssc.zero_grad()
+
+            total_loss.backward()
+
+            optimizer_backbone.step()
+            optimizer_ssc.step()
 
             pred = source_outputs.data.max(1)[1]
             total_hit += pred.eq(source_label.data.cuda()).sum()
@@ -163,15 +205,29 @@ for iDataSet in range(nDataSet):
 
             test_accuracy = 100. * float(total_hit) / size
 
-        
-        print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f},acc {:6.4f}, total loss: {:6.4f}'
-              .format(epoch , cls_loss.item(),lmmd_loss.item(),contrastive_loss_s.item(),contrastive_loss_t.item(),
-               total_hit / size,loss.item()))
+            # 兼容预热期：如果还在预热期，主干网络的损失赋值为 0.0
+            c_loss = cls_loss.item() if epoch > ssc_warmup_epochs else 0.0
+            l_loss = lmmd_loss.item() if epoch > ssc_warmup_epochs else 0.0
+            cs_loss = contrastive_loss_s.item() if epoch > ssc_warmup_epochs else 0.0
+            ct_loss = contrastive_loss_t.item() if epoch > ssc_warmup_epochs else 0.0
+
+            print(
+                'epoch {:>3d}: cls loss: {:6.4f}, lmmd loss: {:6.4f}, con_s loss: {:6.4f}, con_t loss: {:6.4f}, sam loss: {:6.4f}, acc {:6.4f}, total loss: {:6.4f}'
+                .format(epoch,
+                        c_loss,
+                        l_loss,
+                        cs_loss,
+                        ct_loss,
+                        sam_loss.item(),
+                        total_hit / (size + 1e-8),  # 防止 size 为 0 除零报错
+                        total_loss.item()))
 
         train_end = time.time()
         if epoch % epochs == 0:
             # print("Testing ...")
             feature_encoder.eval()
+            ssc_module.eval()
+
             total_rewards = 0
             counter = 0
             accuracies = []
@@ -181,8 +237,18 @@ for iDataSet in range(nDataSet):
                 for test_datas, test_labels in test_loader:
                     batch_size = test_labels.shape[0]
 
+                    test_datas_cuda = Variable(test_datas).type(torch.FloatTensor).cuda()
+
+                    # --- 测试时目标域数据经过 SSC 自校准 ---
+                    test_datas_gf, _ = ssc_module(test_datas_cuda, test_datas_cuda)
+
+                    # 为了满足 feature_encoder 双输入的要求，构造一个与测试批次相同大小的 dummy_source
+                    curr_bs = test_datas_cuda.shape[0]
+                    dummy_source = source_data_gf[:curr_bs] if source_data_gf.shape[0] >= curr_bs else source_data_gf
+
+                    # 送入特征提取器
                     source_features, source1, _, source_outputs, source_out, test_features, _, _, test_outputs, _ = feature_encoder(
-                            Variable(source_data).cuda(), Variable(test_datas).cuda())
+                        dummy_source, test_datas_gf)
 
                     pred = test_outputs.data.max(1)[1]
 

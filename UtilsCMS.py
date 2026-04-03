@@ -153,4 +153,81 @@ def ILDA(data_s,data_t,pca_n,r):
     return ILDA_S,ILDA_T
 
 
+class DiffGuidedFilter(nn.Module):
+    """可微导向滤波"""
+
+    def __init__(self, r=1, eps=1e-8):
+        super(DiffGuidedFilter, self).__init__()
+        self.r = r
+        self.eps = eps
+        self.boxfilter = nn.AvgPool2d(kernel_size=2 * r + 1, stride=1, padding=r, count_include_pad=False)
+
+    def forward(self, guidance, src):
+        N_x = self.boxfilter(torch.ones_like(guidance))
+        mean_x = self.boxfilter(guidance) / (N_x + 1e-8)
+        mean_y = self.boxfilter(src) / (N_x + 1e-8)
+        mean_xx = self.boxfilter(guidance * guidance) / (N_x + 1e-8)
+        mean_xy = self.boxfilter(guidance * src) / (N_x + 1e-8)
+
+        var_x = mean_xx - mean_x * mean_x
+        cov_xy = mean_xy - mean_x * mean_y
+
+        a = cov_xy / (var_x + self.eps)
+        b = mean_y - a * mean_x
+
+        mean_a = self.boxfilter(a) / (N_x + 1e-8)
+        mean_b = self.boxfilter(b) / (N_x + 1e-8)
+        return mean_a * guidance + mean_b
+
+
+class SSC_Replacement(nn.Module):
+    """端到端光谱风格校准模块"""
+
+    def __init__(self, channels, r=1, eps=0.009):
+        super(SSC_Replacement, self).__init__()
+        self.stats_encoder = nn.Sequential(
+            nn.Linear(channels * 2, channels),
+            nn.ReLU()
+        )
+        self.fc_alpha = nn.Linear(channels, channels)
+        self.fc_beta = nn.Linear(channels, channels)
+        self.gf = DiffGuidedFilter(r=r, eps=eps)
+
+        self._initialize_identity()
+
+    def _initialize_identity(self):
+        """近似恒等映射初始化"""
+        nn.init.zeros_(self.fc_alpha.weight)
+        nn.init.zeros_(self.fc_alpha.bias)
+        nn.init.zeros_(self.fc_beta.weight)
+        nn.init.zeros_(self.fc_beta.bias)
+
+    def forward(self, x_s, x_t):
+        B, C, H, W = x_s.shape
+        t_mean = x_t.view(B, C, -1).mean(dim=2)
+        t_var = x_t.view(B, C, -1).var(dim=2)
+        t_stats = torch.cat([t_mean, t_var], dim=1)
+
+        hidden = self.stats_encoder(t_stats)
+        delta_alpha = self.fc_alpha(hidden).view(B, C, 1, 1)
+        beta = self.fc_beta(hidden).view(B, C, 1, 1)
+
+        alpha = 1.0 + delta_alpha
+        x_calibrated = alpha * x_s + beta
+        x_gf = self.gf(guidance=x_calibrated, src=x_s)
+        return x_gf, x_calibrated
+
+
+def spectral_angle_loss(x, x_calibrated):
+    """物理一致性约束：SAM Loss"""
+    x_flat = x.view(x.size(0), x.size(1), -1)
+    xc_flat = x_calibrated.view(x_calibrated.size(0), x_calibrated.size(1), -1)
+
+    dot_product = torch.sum(x_flat * xc_flat, dim=1)
+    norm_x = torch.norm(x_flat, dim=1)
+    norm_xc = torch.norm(xc_flat, dim=1)
+
+    cos_theta = dot_product / (norm_x * norm_xc + 1e-8)
+    cos_theta = torch.clamp(cos_theta, -1.0 + 1e-8, 1.0 - 1e-8)
+    return torch.mean(torch.acos(cos_theta))
 
